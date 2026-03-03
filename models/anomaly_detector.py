@@ -42,8 +42,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import shap
 from sklearn.cluster import KMeans
 from sklearn.ensemble import IsolationForest
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import Ridge
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler
@@ -173,6 +176,19 @@ class BankAnomalyDetector:
         self.pillar_models: Dict[str, Dict[str, Any]] = {}
         self.kmeans: Optional[KMeans] = None
         self.cluster_dna: Dict[str, str] = {}
+
+        # SHAP artefacts (populated by evaluate_model_with_shap)
+        self.global_if_model: Optional[IsolationForest] = None
+        self.shap_explainer: Optional[shap.TreeExplainer] = None
+        self.shap_values: Optional[np.ndarray] = None
+
+        # Multi-model XAI artefacts (populated by compute_multi_model_xai)
+        self.global_lof_model: Optional[LocalOutlierFactor] = None
+        self.global_svm_model: Optional[OneClassSVM] = None
+        self.lof_shap_values: Optional[np.ndarray] = None
+        self.svm_shap_values: Optional[np.ndarray] = None
+        self.permutation_importance_results: Dict[str, Any] = {}
+        self.lime_explanations: Dict[str, Any] = {}
 
         logger.info(
             "BankAnomalyDetector initialised  "
@@ -409,7 +425,263 @@ class BankAnomalyDetector:
         return df
 
     # ------------------------------------------------------------------
-    #  5. Explainability - Anomaly Drivers (feature + group level)
+    #  5. SHAP-based Explainability
+    # ------------------------------------------------------------------
+
+    def evaluate_model_with_shap(
+        self,
+        df_processed: pd.DataFrame,
+    ) -> Tuple[np.ndarray, shap.TreeExplainer]:
+        """Compute SHAP values for the global Isolation Forest model.
+
+        A single Isolation Forest is fitted on *all* 26 ML features so
+        that SHAP feature-importance is comparable across pillars.
+
+        Parameters
+        ----------
+        df_processed : pd.DataFrame
+            Scaled feature matrix (output of ``data_processor.process_data``).
+
+        Returns
+        -------
+        (shap_values, explainer)
+            * ``shap_values`` – numpy array of shape ``(n_samples, 26)``.
+            * ``explainer``   – fitted ``shap.TreeExplainer`` instance.
+        """
+        X = df_processed[ALL_ML_FEATURES].values
+        feature_names = list(ALL_ML_FEATURES)
+
+        logger.info("[SHAP] Fitting global Isolation Forest on %d features ...", len(feature_names))
+        if_model = IsolationForest(
+            contamination=self.contamination,
+            n_estimators=int(ML_MODELS_CONFIG["IsolationForest"]["params"]["n_estimators"]),
+            max_features=ML_MODELS_CONFIG["IsolationForest"]["params"]["max_features"],
+            random_state=self.random_state,
+            n_jobs=-1,
+        )
+        if_model.fit(X)
+        self.global_if_model = if_model
+
+        logger.info("[SHAP] Initialising TreeExplainer ...")
+        explainer = shap.TreeExplainer(
+            if_model,
+            feature_names=feature_names,
+        )
+
+        logger.info("[SHAP] Computing SHAP values for %d observations ...", len(X))
+        shap_values = explainer.shap_values(X)
+
+        # Persist on instance for downstream consumers
+        self.shap_explainer = explainer
+        self.shap_values = shap_values
+
+        logger.info(
+            "[SHAP] Done – shap_values shape: %s  |  mean |SHAP|: %.6f",
+            shap_values.shape, np.abs(shap_values).mean(),
+        )
+        return shap_values, explainer
+
+    # ------------------------------------------------------------------
+    #  5a-2. Multi-Model SHAP (KernelExplainer for LOF & SVM)
+    # ------------------------------------------------------------------
+
+    def compute_multi_model_shap(
+        self,
+        df_processed: pd.DataFrame,
+        n_background: int = 50,
+    ) -> Dict[str, np.ndarray]:
+        """Compute SHAP values for LOF and One-Class SVM using KernelExplainer.
+
+        Uses a background sample for efficiency. Returns dict mapping
+        model name -> shap_values array of shape (n_samples, n_features).
+        """
+        X = df_processed[ALL_ML_FEATURES].values
+        feature_names = list(ALL_ML_FEATURES)
+        n_bg = min(n_background, len(X))
+        background = shap.sample(pd.DataFrame(X, columns=feature_names), n_bg)
+
+        results: Dict[str, np.ndarray] = {}
+
+        # --- LOF ---
+        logger.info("[XAI-SHAP] Fitting global LOF on %d features ...", len(feature_names))
+        lof_model = LocalOutlierFactor(
+            n_neighbors=int(ML_MODELS_CONFIG["LocalOutlierFactor"]["params"]["n_neighbors"]),
+            contamination=self.contamination,
+            novelty=True,
+            n_jobs=-1,
+        )
+        lof_model.fit(X)
+        self.global_lof_model = lof_model
+
+        logger.info("[XAI-SHAP] KernelExplainer for LOF ...")
+        lof_explainer = shap.KernelExplainer(lof_model.decision_function, background)
+        lof_shap = lof_explainer.shap_values(X, nsamples=100)
+        self.lof_shap_values = lof_shap
+        results["LOF"] = lof_shap
+        logger.info("[XAI-SHAP] LOF SHAP done – shape: %s", lof_shap.shape)
+
+        # --- SVM ---
+        logger.info("[XAI-SHAP] Fitting global One-Class SVM on %d features ...", len(feature_names))
+        svm_model = OneClassSVM(
+            kernel=ML_MODELS_CONFIG["OneClassSVM"]["params"]["kernel"],
+            gamma=ML_MODELS_CONFIG["OneClassSVM"]["params"]["gamma"],
+            nu=self.contamination,
+        )
+        svm_model.fit(X)
+        self.global_svm_model = svm_model
+
+        logger.info("[XAI-SHAP] KernelExplainer for SVM ...")
+        svm_explainer = shap.KernelExplainer(svm_model.decision_function, background)
+        svm_shap = svm_explainer.shap_values(X, nsamples=100)
+        self.svm_shap_values = svm_shap
+        results["SVM"] = svm_shap
+        logger.info("[XAI-SHAP] SVM SHAP done – shape: %s", svm_shap.shape)
+
+        # IF already computed by evaluate_model_with_shap
+        if self.shap_values is not None:
+            results["IF"] = self.shap_values
+
+        return results
+
+    # ------------------------------------------------------------------
+    #  5a-3. Permutation Feature Importance (model-agnostic)
+    # ------------------------------------------------------------------
+
+    def compute_permutation_importance(
+        self,
+        df_processed: pd.DataFrame,
+        n_repeats: int = 10,
+    ) -> Dict[str, Dict[str, np.ndarray]]:
+        """Compute permutation feature importance for all 3 global models.
+
+        For unsupervised models, uses ``score_samples`` (IF, LOF) or
+        ``decision_function`` (SVM) as the scoring function.
+
+        Returns dict: {model_name: {"importances_mean": array, "importances_std": array}}
+        """
+        X = df_processed[ALL_ML_FEATURES].values
+        results: Dict[str, Dict[str, np.ndarray]] = {}
+
+        models = {
+            "IF": self.global_if_model,
+            "LOF": self.global_lof_model,
+            "SVM": self.global_svm_model,
+        }
+
+        for name, model in models.items():
+            if model is None:
+                logger.warning("[XAI-PI] Model '%s' not fitted – skipping.", name)
+                continue
+
+            logger.info("[XAI-PI] Permutation importance for %s ...", name)
+            try:
+                pi = permutation_importance(
+                    model, X, model.decision_function(X),
+                    n_repeats=n_repeats,
+                    random_state=self.random_state,
+                    n_jobs=-1,
+                    scoring="neg_mean_squared_error",
+                )
+                results[name] = {
+                    "importances_mean": pi.importances_mean,
+                    "importances_std": pi.importances_std,
+                }
+                logger.info(
+                    "[XAI-PI] %s done – top feature idx: %d",
+                    name, int(np.argmax(pi.importances_mean)),
+                )
+            except Exception as e:
+                logger.warning("[XAI-PI] %s failed: %s", name, e)
+
+        self.permutation_importance_results = results
+        return results
+
+    # ------------------------------------------------------------------
+    #  5a-4. Local Surrogate Explanations (LIME-style)
+    # ------------------------------------------------------------------
+
+    def compute_local_surrogate(
+        self,
+        df_processed: pd.DataFrame,
+        bank_indices: Optional[List[int]] = None,
+        n_perturbations: int = 500,
+        kernel_width: float = 0.75,
+    ) -> Dict[str, Dict[int, Dict[str, float]]]:
+        """Generate LIME-style local surrogate explanations for selected banks.
+
+        For each bank and each model, perturbs the input around the bank's
+        feature values, queries the model, and fits a weighted Ridge
+        regression to approximate the local decision boundary.
+
+        Parameters
+        ----------
+        df_processed : DataFrame with scaled features.
+        bank_indices : List of row indices to explain. If None, explains
+                       all anomalous banks (is_anomaly == -1).
+        n_perturbations : Number of perturbed samples per bank.
+        kernel_width : Width of the exponential kernel for weighting.
+
+        Returns
+        -------
+        Dict[model_name, Dict[bank_idx, Dict[feature_name, coefficient]]]
+        """
+        X = df_processed[ALL_ML_FEATURES].values
+        feature_names = list(ALL_ML_FEATURES)
+        rng = np.random.default_rng(self.random_state)
+
+        models = {
+            "IF": self.global_if_model,
+            "LOF": self.global_lof_model,
+            "SVM": self.global_svm_model,
+        }
+
+        if bank_indices is None:
+            bank_indices = list(range(min(20, len(X))))
+
+        results: Dict[str, Dict[int, Dict[str, float]]] = {}
+
+        for model_name, model in models.items():
+            if model is None:
+                continue
+            results[model_name] = {}
+            logger.info(
+                "[XAI-LIME] Local surrogate for %s on %d banks ...",
+                model_name, len(bank_indices),
+            )
+
+            for idx in bank_indices:
+                x_orig = X[idx]
+                # Generate perturbations around the original point
+                noise = rng.normal(0, 1, size=(n_perturbations, len(feature_names)))
+                X_perturbed = x_orig + noise * kernel_width
+
+                # Stack original + perturbations
+                X_local = np.vstack([x_orig.reshape(1, -1), X_perturbed])
+
+                # Get model predictions (decision_function scores)
+                try:
+                    scores = model.decision_function(X_local)
+                except Exception:
+                    continue
+
+                # Compute distances and exponential kernel weights
+                distances = np.sqrt(((X_local - x_orig) ** 2).sum(axis=1))
+                weights = np.exp(-(distances ** 2) / (kernel_width ** 2))
+
+                # Fit weighted Ridge regression as local surrogate
+                surrogate = Ridge(alpha=1.0)
+                surrogate.fit(X_local, scores, sample_weight=weights)
+
+                # Feature contributions = coefficients
+                contributions = dict(zip(feature_names, surrogate.coef_))
+                results[model_name][idx] = contributions
+
+        self.lime_explanations = results
+        logger.info("[XAI-LIME] Local surrogate complete for %d models.", len(results))
+        return results
+
+    # ------------------------------------------------------------------
+    #  5b. Anomaly Drivers (SHAP-enhanced with top-3)
     # ------------------------------------------------------------------
 
     def get_anomaly_drivers(
@@ -419,27 +691,68 @@ class BankAnomalyDetector:
     ) -> Tuple[pd.Series, pd.Series]:
         """Identify per-anomaly primary driver feature AND the risk group.
 
-        Uses z-score deviation across all 26 ML features to find the
-        single most deviating feature per flagged observation.
+        When SHAP values are available (``self.shap_values is not None``),
+        drivers are determined by the **top SHAP contributor** pushing the
+        observation towards the anomaly boundary – a principled,
+        model-faithful attribution.  A ``shap_top3_drivers`` column is
+        also appended to ``df_original`` (via the caller) for UI display.
+
+        Falls back to z-score deviation when SHAP is unavailable.
         """
         drivers = pd.Series("N/A", index=df_original.index)
         driver_groups = pd.Series("N/A", index=df_original.index)
+        # Prepare top-3 column (list of dicts per row)
+        top3_all: List[Optional[List[Dict[str, Any]]]] = [None] * len(df_original)
         bool_mask = (anomaly_mask == -1)
 
         if not bool_mask.any():
             logger.info("No anomalies - skipping driver analysis.")
+            self._shap_top3 = top3_all
             return drivers, driver_groups
 
         logger.info("Computing anomaly drivers for %d flagged banks", int(bool_mask.sum()))
 
-        medians = df_original[ALL_ML_FEATURES].median()
-        stds = df_original[ALL_ML_FEATURES].std().replace(0, np.nan)
+        # ---------- SHAP-based attribution ----------------------------
+        if self.shap_values is not None:
+            logger.info("  Using SHAP values for driver attribution.")
+            features = list(ALL_ML_FEATURES)
+            sv = self.shap_values  # (n_samples, n_features)
 
-        anomaly_rows = df_original.loc[bool_mask, ALL_ML_FEATURES]
-        z_devs = (anomaly_rows - medians).abs() / stds
-        top_feature = z_devs.idxmax(axis=1)
-        drivers.loc[bool_mask] = top_feature
-        driver_groups.loc[bool_mask] = top_feature.map(_FEATURE_TO_GROUP)
+            for idx in df_original.index[bool_mask]:
+                pos = df_original.index.get_loc(idx)
+                row_shap = sv[pos]  # 1-D array, one value per feature
+                # For Isolation Forest shorter path → anomaly, shap value
+                # sign convention may vary; use absolute magnitude.
+                abs_shap = np.abs(row_shap)
+                top3_idx = np.argsort(abs_shap)[::-1][:3]
+
+                top3_info: List[Dict[str, Any]] = []
+                for rank, fi in enumerate(top3_idx):
+                    feat_name = features[fi]
+                    top3_info.append({
+                        "rank": rank + 1,
+                        "feature": feat_name,
+                        "shap_value": float(row_shap[fi]),
+                        "group": _FEATURE_TO_GROUP.get(feat_name, "Unknown"),
+                    })
+
+                top3_all[pos] = top3_info
+                # Primary driver = top-1 by |SHAP|
+                drivers.iloc[pos] = top3_info[0]["feature"]
+                driver_groups.iloc[pos] = top3_info[0]["group"]
+        else:
+            # ---------- Fallback: z-score deviation --------------------
+            logger.info("  SHAP unavailable – falling back to z-score drivers.")
+            medians = df_original[ALL_ML_FEATURES].median()
+            stds = df_original[ALL_ML_FEATURES].std().replace(0, np.nan)
+
+            anomaly_rows = df_original.loc[bool_mask, ALL_ML_FEATURES]
+            z_devs = (anomaly_rows - medians).abs() / stds
+            top_feature = z_devs.idxmax(axis=1)
+            drivers.loc[bool_mask] = top_feature
+            driver_groups.loc[bool_mask] = top_feature.map(_FEATURE_TO_GROUP)
+
+        self._shap_top3 = top3_all
 
         group_counts = driver_groups.loc[bool_mask].value_counts()
         for grp, cnt in group_counts.items():
@@ -542,14 +855,48 @@ class BankAnomalyDetector:
         logger.info("[Step 4/6] Risk Clustering + Sector DNA")
         df_clustered = self.cluster_banks(df_consensus, df_original)
 
-        # Step 5: Driver analysis (feature + group level)
-        logger.info("[Step 5/6] Explainability - Anomaly Drivers")
+        # Step 5: SHAP explainability (global Isolation Forest)
+        logger.info("[Step 5/10] SHAP Explainability (Global IF)")
+        try:
+            self.evaluate_model_with_shap(df_processed)
+        except Exception as e:
+            logger.warning("[Step 5/10] SHAP computation failed: %s – falling back to z-score.", e)
+
+        # Step 6: Multi-model SHAP (LOF & SVM via KernelExplainer)
+        logger.info("[Step 6/10] Multi-Model SHAP (LOF, SVM)")
+        try:
+            self.compute_multi_model_shap(df_processed)
+        except Exception as e:
+            logger.warning("[Step 6/10] Multi-model SHAP failed: %s", e)
+
+        # Step 7: Permutation Feature Importance (all 3 models)
+        logger.info("[Step 7/10] Permutation Feature Importance")
+        try:
+            self.compute_permutation_importance(df_processed)
+        except Exception as e:
+            logger.warning("[Step 7/10] Permutation importance failed: %s", e)
+
+        # Step 8: Local Surrogate (LIME-style) for anomalous banks
+        logger.info("[Step 8/10] Local Surrogate Explanations (LIME-style)")
+        try:
+            anomaly_indices = list(
+                np.where(df_clustered["is_anomaly"].values == -1)[0]
+            )[:20]  # limit to 20 banks for performance
+            if anomaly_indices:
+                self.compute_local_surrogate(df_processed, bank_indices=anomaly_indices)
+            else:
+                logger.info("[Step 8/10] No anomalies – skipping local surrogate.")
+        except Exception as e:
+            logger.warning("[Step 8/10] Local surrogate failed: %s", e)
+
+        # Step 9: Driver analysis (SHAP-enhanced with top-3)
+        logger.info("[Step 9/10] Anomaly Drivers (SHAP-enhanced)")
         anomaly_driver, anomaly_driver_group = self.get_anomaly_drivers(
             df_original, df_clustered["is_anomaly"]
         )
 
-        # Step 6: OBS risk contribution
-        logger.info("[Step 6/6] OBS Risk Contribution")
+        # Step 10: OBS risk contribution
+        logger.info("[Step 10/10] OBS Risk Contribution")
         obs_flag, obs_zscore = self.compute_obs_risk_contribution(
             df_original, df_clustered["is_anomaly"]
         )
@@ -576,6 +923,7 @@ class BankAnomalyDetector:
         df_result["cluster_dna"] = df_clustered["cluster_dna"].values
         df_result["anomaly_driver"] = anomaly_driver.values
         df_result["anomaly_driver_group"] = anomaly_driver_group.values
+        df_result["shap_top3_drivers"] = self._shap_top3
         df_result["obs_risk_flag"] = obs_flag.values
         df_result["obs_risk_zscore"] = obs_zscore.values
 

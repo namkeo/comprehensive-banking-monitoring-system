@@ -197,6 +197,38 @@ EXPERT_RULES: Dict[str, Dict[str, Any]] = {
         "pillar":    "Concentration Risk",
         "message":   "Sector HHI above 0.25 – high lending concentration in few sectors.",
     },
+    "NSFR_CRITICAL": {
+        "column":    "nsfr",
+        "op":        "lt",
+        "threshold": 1.0,
+        "severity":  "critical",
+        "pillar":    "Liquidity Risk",
+        "message":   "NSFR below 100% – insufficient stable funding relative to required stable funding (Basel III breach).",
+    },
+    "ROA_WARNING": {
+        "column":    "return_on_assets",
+        "op":        "lt",
+        "threshold": 0.0,
+        "severity":  "warning",
+        "pillar":    "Earnings & Efficiency",
+        "message":   "ROA below 0% – bank is operating at a loss, negative profitability.",
+    },
+    "WHOLESALE_DEPENDENCY_WARNING": {
+        "column":    "wholesale_dependency_ratio",
+        "op":        "gt",
+        "threshold": 0.5,
+        "severity":  "warning",
+        "pillar":    "Funding Stability",
+        "message":   "Wholesale dependency ratio above 50% – excessive reliance on wholesale funding.",
+    },
+    "TOP20_BORROWER_CONCENTRATION_WARNING": {
+        "column":    "top20_borrower_concentration",
+        "op":        "gt",
+        "threshold": 0.25,
+        "severity":  "warning",
+        "pillar":    "Concentration Risk",
+        "message":   "Top-20 borrower concentration above 25% – high single-name credit risk.",
+    },
 }
 
 

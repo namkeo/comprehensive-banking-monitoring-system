@@ -2,13 +2,14 @@
 app.py - BankGuard AI 360 Dashboard.
 =========================================
 
-4-tab Streamlit command-center leveraging the Multi-Algorithm Consensus
-Scoring Engine and Expert Rule Engine:
+5-tab Streamlit command-center leveraging the Multi-Algorithm Consensus
+Scoring Engine, Expert Rule Engine and SHAP Explainability:
 
     Tab 1 - Executive Summary     (KPI cards, Risk Trajectory line chart)
     Tab 2 - Multi-Algo Comparison (IF/LOF/SVM agreement heatmap)
     Tab 3 - Risk Pillar Deep Dive (per-pillar scatter, outlier coloring)
     Tab 4 - 360 Bank Profiler     (radar, rule violations, funding pie)
+    Tab 5 - XAI & Model Evaluation (Global SHAP importance, Local waterfall)
 
 Author : BankGuard AI Team - Senior Streamlit UI/UX Developer
 Created: 2026-03-02
@@ -32,7 +33,7 @@ from config import (
     SECTOR_LABELS,
     SECTOR_LOANS_COLUMNS,
 )
-from models.anomaly_detector import BankAnomalyDetector, PILLAR_KEYS
+from models.anomaly_detector import BankAnomalyDetector, PILLAR_KEYS, _FEATURE_TO_GROUP
 from utils.data_processor import process_data
 
 # =====================================================================
@@ -180,11 +181,30 @@ def _make_radar(
 
 @st.cache_data(show_spinner="Loading & processing banking data ...")
 def load_and_process():
-    """Run the full data pipeline + ML analysis and cache the result."""
+    """Run the full data pipeline + ML analysis + SHAP and cache the result."""
     df_processed, df_original, scalers = process_data()
     detector = BankAnomalyDetector()
     df_result = detector.run_full_analysis(df_processed, df_original)
-    return df_result, scalers
+
+    # Package SHAP artefacts for the XAI tab
+    shap_values = detector.shap_values      # ndarray (n, 26) or None
+    shap_base_value = None
+    if detector.shap_explainer is not None:
+        ev = detector.shap_explainer.expected_value
+        # expected_value can be a scalar or an array; normalise to float
+        if hasattr(ev, '__len__'):
+            shap_base_value = float(ev[0]) if len(ev) > 0 else 0.0
+        else:
+            shap_base_value = float(ev)
+
+    # Multi-model XAI artefacts
+    xai_artifacts = {
+        "lof_shap_values": detector.lof_shap_values,
+        "svm_shap_values": detector.svm_shap_values,
+        "permutation_importance": detector.permutation_importance_results,
+        "lime_explanations": detector.lime_explanations,
+    }
+    return df_result, scalers, shap_values, shap_base_value, xai_artifacts
 
 
 # =====================================================================
@@ -208,7 +228,7 @@ with st.sidebar:
 
     st.markdown("#### Filters")
 
-    df_full, _scalers = load_and_process()
+    df_full, _scalers, _shap_values, _shap_base, _xai_artifacts = load_and_process()
     df_full["_period_dt"] = pd.to_datetime(df_full["period"], format="mixed")
 
     # Filter options
@@ -276,11 +296,12 @@ st.caption(
 #  Tabs (4)
 # =====================================================================
 
-tab_exec, tab_algo, tab_pillar, tab_profiler = st.tabs([
+tab_exec, tab_algo, tab_pillar, tab_profiler, tab_xai = st.tabs([
     "Executive Summary",
     "Multi-Algo Comparison",
     "Risk Pillar Deep Dive",
     "360 Bank Profiler",
+    "XAI & Model Evaluation",
 ])
 
 # Consensus column names
@@ -961,3 +982,468 @@ with tab_profiler:
         file_name="bankguard_full_report.csv", mime="text/csv",
         width='stretch',
     )
+
+
+# -----------------------------------------------------------------
+#  TAB 5 - XAI & Model Evaluation (Multi-Model)
+# -----------------------------------------------------------------
+
+with tab_xai:
+    st.subheader("Explainable AI & Model Evaluation")
+    st.caption(
+        "Comprehensive XAI analysis using **SHAP**, **Permutation Importance**, "
+        "and **Local Surrogate (LIME-style)** across all 3 models: "
+        "Isolation Forest, LOF, One-Class SVM."
+    )
+
+    # Retrieve cached artefacts
+    shap_values = _shap_values
+    shap_base = _shap_base
+    feature_names = list(ALL_ML_FEATURES)
+    feature_display = [FEATURE_LABELS.get(f, f) for f in feature_names]
+    lof_shap_values = _xai_artifacts.get("lof_shap_values")
+    svm_shap_values = _xai_artifacts.get("svm_shap_values")
+    perm_imp = _xai_artifacts.get("permutation_importance", {})
+    lime_expl = _xai_artifacts.get("lime_explanations", {})
+
+    if shap_values is None:
+        st.warning(
+            "SHAP values are not available. Click **Run Analysis** to retry."
+        )
+        st.stop()
+
+    # XAI method selector
+    xai_method = st.radio(
+        "Select XAI Method",
+        ["SHAP (Multi-Model)", "Permutation Importance", "Local Surrogate (LIME-style)"],
+        horizontal=True,
+        key="xai_method_radio",
+    )
+
+    # ==================================================================
+    #  5A — SHAP (Multi-Model)
+    # ==================================================================
+    if xai_method == "SHAP (Multi-Model)":
+        shap_model_choice = st.selectbox(
+            "Select Model for SHAP Analysis",
+            ["Isolation Forest", "LOF (Local Outlier Factor)", "One-Class SVM", "Cross-Model Comparison"],
+            key="shap_model_select",
+        )
+
+        def _get_shap_for_model(model_choice):
+            if "Isolation" in model_choice:
+                return shap_values, "Isolation Forest"
+            elif "LOF" in model_choice:
+                return lof_shap_values, "LOF"
+            elif "SVM" in model_choice:
+                return svm_shap_values, "One-Class SVM"
+            return None, ""
+
+        if "Cross-Model" in shap_model_choice:
+            st.markdown("##### Cross-Model Feature Importance Comparison (mean |SHAP|)")
+            st.caption(
+                "Compare which features each model considers most important. "
+                "Features consistently ranked high across all 3 models are robust risk indicators."
+            )
+            all_models_shap = {
+                "Isolation Forest": shap_values,
+                "LOF": lof_shap_values,
+                "One-Class SVM": svm_shap_values,
+            }
+            comparison_rows = []
+            for mname, sv in all_models_shap.items():
+                if sv is not None:
+                    mean_abs = np.abs(sv).mean(axis=0)
+                    for i, fname in enumerate(feature_names):
+                        comparison_rows.append({
+                            "Feature": FEATURE_LABELS.get(fname, fname),
+                            "Feature_Key": fname,
+                            "Model": mname,
+                            "Mean |SHAP|": mean_abs[i],
+                        })
+            if comparison_rows:
+                comp_df = pd.DataFrame(comparison_rows)
+                fig_comp = px.bar(
+                    comp_df, x="Mean |SHAP|", y="Feature", color="Model",
+                    orientation="h", barmode="group", template=PLOTLY_TEMPLATE,
+                    color_discrete_map={
+                        "Isolation Forest": "#2ecc71",
+                        "LOF": "#3498db",
+                        "One-Class SVM": "#e74c3c",
+                    },
+                )
+                fig_comp.update_layout(
+                    height=max(550, len(feature_names) * 28),
+                    margin=dict(l=10, r=20, t=30, b=20),
+                    yaxis=dict(categoryorder="total ascending"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                xanchor="center", x=0.5, title=None),
+                )
+                st.plotly_chart(fig_comp, width='stretch')
+
+                st.markdown("##### Top-5 Features per Model")
+                t5_cols = st.columns(3)
+                for ci, (mname, sv) in enumerate(all_models_shap.items()):
+                    if sv is not None:
+                        mean_abs = np.abs(sv).mean(axis=0)
+                        top5_idx = np.argsort(mean_abs)[::-1][:5]
+                        with t5_cols[ci]:
+                            st.markdown(f"**{mname}**")
+                            for rank, fi in enumerate(top5_idx):
+                                st.markdown(
+                                    f"{rank+1}. {FEATURE_LABELS.get(feature_names[fi], feature_names[fi])} "
+                                    f"({mean_abs[fi]:.4f})"
+                                )
+            else:
+                st.info("No multi-model SHAP data available.")
+
+        else:
+            sel_sv, sel_name = _get_shap_for_model(shap_model_choice)
+            if sel_sv is None:
+                st.warning(f"SHAP values for {shap_model_choice} are not available.")
+            else:
+                st.markdown(f"##### Global Feature Importance — {sel_name} (mean |SHAP|)")
+                mean_abs_shap = np.abs(sel_sv).mean(axis=0)
+                global_df = pd.DataFrame({
+                    "Feature": feature_display,
+                    "Feature_Key": feature_names,
+                    "Mean |SHAP|": mean_abs_shap,
+                }).sort_values("Mean |SHAP|", ascending=True)
+                global_df["Risk Pillar"] = global_df["Feature_Key"].map(_FEATURE_TO_GROUP)
+
+                fig_global = px.bar(
+                    global_df, x="Mean |SHAP|", y="Feature", orientation="h",
+                    color="Risk Pillar", color_discrete_map=PILLAR_COLORS,
+                    template=PLOTLY_TEMPLATE,
+                    labels={"Mean |SHAP|": "Mean |SHAP Value|", "Feature": ""},
+                )
+                fig_global.update_layout(
+                    height=max(480, len(feature_names) * 24),
+                    margin=dict(l=10, r=20, t=30, b=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                xanchor="center", x=0.5, title=None),
+                    yaxis=dict(categoryorder="total ascending"),
+                )
+                st.plotly_chart(fig_global, width='stretch')
+
+                top5 = global_df.nlargest(5, "Mean |SHAP|")
+                top5_str = ", ".join(
+                    f"**{row['Feature']}** ({row['Risk Pillar']})"
+                    for _, row in top5.iterrows()
+                )
+                st.info(f"**Top 5 Drivers ({sel_name}):** {top5_str}")
+                st.markdown("---")
+
+                # Beeswarm scatter
+                st.markdown(f"##### SHAP Feature Impact Distribution — {sel_name}")
+                selected_global_feat = st.selectbox(
+                    "Select feature for distribution view",
+                    options=feature_names,
+                    format_func=lambda f: FEATURE_LABELS.get(f, f),
+                    index=0,
+                    key="xai_global_feat",
+                )
+                feat_idx = feature_names.index(selected_global_feat)
+                df_snap_xai = _get_latest_snapshot(df)
+                snap_positions = [df.index.get_loc(i) for i in df_snap_xai.index if i in df.index]
+                snap_shap_col = sel_sv[snap_positions, feat_idx] if len(snap_positions) == len(df_snap_xai) else sel_sv[:len(df_snap_xai), feat_idx]
+                snap_feat_vals = df_snap_xai[selected_global_feat].values
+
+                fig_bee = px.scatter(
+                    x=snap_shap_col,
+                    y=np.random.default_rng(42).normal(0, 0.15, size=len(snap_shap_col)),
+                    color=snap_feat_vals,
+                    color_continuous_scale="RdBu_r",
+                    labels={"x": f"SHAP Value ({FEATURE_LABELS.get(selected_global_feat, selected_global_feat)})",
+                            "y": "", "color": "Feature Value"},
+                    template=PLOTLY_TEMPLATE,
+                )
+                fig_bee.update_layout(
+                    height=340,
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
+                )
+                fig_bee.add_vline(x=0, line_dash="dash", line_color="grey", opacity=0.5)
+                st.plotly_chart(fig_bee, width='stretch')
+                st.markdown("---")
+
+                # Local Waterfall
+                st.markdown(f"##### Local Explanation — Per-Bank SHAP Waterfall ({sel_name})")
+                df_snap_local = _get_latest_snapshot(df).copy()
+                df_snap_local["_sort"] = df_snap_local["Overall_ML_Risk_Score"]
+                df_snap_local = df_snap_local.sort_values("_sort", ascending=False)
+                local_bank_ids = df_snap_local["bank_id"].tolist()
+
+                selected_xai_bank = st.selectbox(
+                    "Select Bank ID (sorted by ML Risk Score desc.)",
+                    options=local_bank_ids, index=0,
+                    key="xai_bank_select",
+                )
+                bank_row = df_snap_local[df_snap_local["bank_id"] == selected_xai_bank].iloc[0]
+                bank_global_idx = df.index.get_loc(bank_row.name) if bank_row.name in df.index else 0
+                bank_shap = sel_sv[bank_global_idx]
+
+                lc1, lc2, lc3, lc4 = st.columns(4)
+                lc1.metric("Bank", selected_xai_bank)
+                lc2.metric("Hybrid Status", str(bank_row.get("Final_Hybrid_Risk_Status", "N/A")))
+                lc3.metric("ML Risk Score", f"{bank_row.get('Overall_ML_Risk_Score', 0):.1f}")
+                lc4.metric("Rule Violations", int(bank_row.get("rule_risk_score", 0)))
+
+                wf_df = pd.DataFrame({
+                    "Feature": feature_display,
+                    "Feature_Key": feature_names,
+                    "SHAP": bank_shap,
+                    "Abs_SHAP": np.abs(bank_shap),
+                }).sort_values("Abs_SHAP", ascending=True)
+                wf_df["Color"] = wf_df["SHAP"].apply(
+                    lambda v: "#e74c3c" if v > 0 else "#2ecc71"
+                )
+
+                fig_wf = go.Figure(go.Bar(
+                    x=wf_df["SHAP"], y=wf_df["Feature"], orientation="h",
+                    marker=dict(color=wf_df["Color"].tolist(), line=dict(width=0)),
+                    text=[f"{v:+.4f}" for v in wf_df["SHAP"]],
+                    textposition="outside",
+                    hovertemplate="<b>%{y}</b><br>SHAP: %{x:+.4f}<extra></extra>",
+                ))
+                fig_wf.add_vline(x=0, line_color="grey", line_width=1.5)
+                fig_wf.update_layout(
+                    xaxis=dict(title=f"SHAP Value — {sel_name}"),
+                    yaxis=dict(title=""),
+                    template=PLOTLY_TEMPLATE,
+                    height=max(480, len(feature_names) * 24),
+                    margin=dict(l=10, r=60, t=30, b=20),
+                )
+                st.plotly_chart(fig_wf, width='stretch')
+
+                # Top-3 table
+                st.markdown(f"##### Top-3 SHAP Drivers — {sel_name} for **{selected_xai_bank}**")
+                top3_local = wf_df.nlargest(3, "Abs_SHAP")[["Feature", "Feature_Key", "SHAP"]].copy()
+                top3_local["Risk Pillar"] = top3_local["Feature_Key"].map(_FEATURE_TO_GROUP)
+                top3_local["Direction"] = top3_local["SHAP"].apply(
+                    lambda v: "Toward Anomaly" if v > 0 else "Away from Anomaly"
+                )
+                top3_local = top3_local.rename(columns={"SHAP": "SHAP Value"}).reset_index(drop=True)
+                top3_local.index = top3_local.index + 1
+                top3_local.index.name = "Rank"
+                st.dataframe(
+                    top3_local[["Feature", "Risk Pillar", "SHAP Value", "Direction"]],
+                    width='stretch',
+                )
+
+    # ==================================================================
+    #  5B — Permutation Feature Importance
+    # ==================================================================
+    elif xai_method == "Permutation Importance":
+        st.markdown("##### Permutation Feature Importance (Model-Agnostic)")
+        st.caption(
+            "Measures how much the model's output degrades when each feature "
+            "is randomly shuffled. Higher importance = the model relies more "
+            "on that feature. Works identically for all 3 model types."
+        )
+
+        if not perm_imp:
+            st.warning("Permutation importance data not available. Click **Run Analysis** to retry.")
+        else:
+            pi_model_choice = st.selectbox(
+                "Select Model",
+                ["All Models (Comparison)"] + [k for k in perm_imp.keys()],
+                key="pi_model_select",
+            )
+
+            if pi_model_choice == "All Models (Comparison)":
+                pi_rows = []
+                for mname, pi_data in perm_imp.items():
+                    imp_mean = pi_data["importances_mean"]
+                    for i, fname in enumerate(feature_names):
+                        pi_rows.append({
+                            "Feature": FEATURE_LABELS.get(fname, fname),
+                            "Model": {"IF": "Isolation Forest", "LOF": "LOF", "SVM": "One-Class SVM"}.get(mname, mname),
+                            "Importance": imp_mean[i],
+                        })
+                if pi_rows:
+                    pi_df = pd.DataFrame(pi_rows)
+                    fig_pi = px.bar(
+                        pi_df, x="Importance", y="Feature", color="Model",
+                        orientation="h", barmode="group", template=PLOTLY_TEMPLATE,
+                        color_discrete_map={
+                            "Isolation Forest": "#2ecc71",
+                            "LOF": "#3498db",
+                            "One-Class SVM": "#e74c3c",
+                        },
+                    )
+                    fig_pi.update_layout(
+                        height=max(550, len(feature_names) * 28),
+                        margin=dict(l=10, r=20, t=30, b=20),
+                        yaxis=dict(categoryorder="total ascending"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="center", x=0.5, title=None),
+                    )
+                    st.plotly_chart(fig_pi, width='stretch')
+            else:
+                pi_data = perm_imp[pi_model_choice]
+                imp_mean = pi_data["importances_mean"]
+                imp_std = pi_data["importances_std"]
+                pi_single = pd.DataFrame({
+                    "Feature": feature_display,
+                    "Feature_Key": feature_names,
+                    "Importance": imp_mean,
+                    "Std": imp_std,
+                }).sort_values("Importance", ascending=True)
+                pi_single["Risk Pillar"] = pi_single["Feature_Key"].map(_FEATURE_TO_GROUP)
+
+                model_label = {"IF": "Isolation Forest", "LOF": "LOF", "SVM": "One-Class SVM"}.get(pi_model_choice, pi_model_choice)
+                fig_pi_s = px.bar(
+                    pi_single, x="Importance", y="Feature", orientation="h",
+                    color="Risk Pillar", color_discrete_map=PILLAR_COLORS,
+                    template=PLOTLY_TEMPLATE,
+                    error_x="Std",
+                    labels={"Importance": "Permutation Importance", "Feature": ""},
+                )
+                fig_pi_s.update_layout(
+                    height=max(480, len(feature_names) * 24),
+                    margin=dict(l=10, r=20, t=30, b=20),
+                    yaxis=dict(categoryorder="total ascending"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                xanchor="center", x=0.5, title=None),
+                    title=f"Permutation Importance — {model_label}",
+                )
+                st.plotly_chart(fig_pi_s, width='stretch')
+
+                top5_pi = pi_single.nlargest(5, "Importance")
+                top5_pi_str = ", ".join(
+                    f"**{row['Feature']}** ({row['Risk Pillar']})"
+                    for _, row in top5_pi.iterrows()
+                )
+                st.info(f"**Top 5 ({model_label}):** {top5_pi_str}")
+
+    # ==================================================================
+    #  5C — Local Surrogate (LIME-style)
+    # ==================================================================
+    elif xai_method == "Local Surrogate (LIME-style)":
+        st.markdown("##### Local Surrogate Explanations (LIME-style)")
+        st.caption(
+            "For each selected bank, a local linear model (Ridge regression) is fitted "
+            "on perturbed samples around the bank's feature values. The coefficients "
+            "reveal which features locally drive the model's anomaly decision. "
+            "This is model-agnostic and works for all 3 algorithms."
+        )
+
+        if not lime_expl:
+            st.warning(
+                "Local surrogate explanations not available. This requires anomalous "
+                "banks to be detected. Click **Run Analysis** to retry."
+            )
+        else:
+            lime_model_choice = st.selectbox(
+                "Select Model",
+                list(lime_expl.keys()),
+                format_func=lambda k: {"IF": "Isolation Forest", "LOF": "LOF", "SVM": "One-Class SVM"}.get(k, k),
+                key="lime_model_select",
+            )
+
+            model_lime = lime_expl.get(lime_model_choice, {})
+            if not model_lime:
+                st.info(f"No local surrogate data for {lime_model_choice}.")
+            else:
+                available_indices = sorted(model_lime.keys())
+                # Map indices to bank_ids for display
+                df_snap_lime = _get_latest_snapshot(df)
+                idx_to_bank = {}
+                for idx in available_indices:
+                    if idx < len(df):
+                        bank_id = df.iloc[idx].get("bank_id", f"Index {idx}")
+                        idx_to_bank[idx] = bank_id
+                    else:
+                        idx_to_bank[idx] = f"Index {idx}"
+
+                selected_lime_bank_idx = st.selectbox(
+                    "Select Bank (anomalous banks only)",
+                    options=available_indices,
+                    format_func=lambda i: f"{idx_to_bank.get(i, i)} (idx={i})",
+                    key="lime_bank_select",
+                )
+
+                contributions = model_lime[selected_lime_bank_idx]
+                lime_df = pd.DataFrame({
+                    "Feature": [FEATURE_LABELS.get(f, f) for f in contributions.keys()],
+                    "Feature_Key": list(contributions.keys()),
+                    "Coefficient": list(contributions.values()),
+                    "Abs_Coeff": [abs(v) for v in contributions.values()],
+                }).sort_values("Abs_Coeff", ascending=True)
+                lime_df["Risk Pillar"] = lime_df["Feature_Key"].map(_FEATURE_TO_GROUP)
+                lime_df["Color"] = lime_df["Coefficient"].apply(
+                    lambda v: "#e74c3c" if v > 0 else "#2ecc71"
+                )
+
+                model_label = {"IF": "Isolation Forest", "LOF": "LOF", "SVM": "One-Class SVM"}.get(lime_model_choice, lime_model_choice)
+                bank_label = idx_to_bank.get(selected_lime_bank_idx, selected_lime_bank_idx)
+
+                fig_lime = go.Figure(go.Bar(
+                    x=lime_df["Coefficient"], y=lime_df["Feature"], orientation="h",
+                    marker=dict(color=lime_df["Color"].tolist(), line=dict(width=0)),
+                    text=[f"{v:+.4f}" for v in lime_df["Coefficient"]],
+                    textposition="outside",
+                    hovertemplate="<b>%{y}</b><br>Coefficient: %{x:+.4f}<extra></extra>",
+                ))
+                fig_lime.add_vline(x=0, line_color="grey", line_width=1.5)
+                fig_lime.update_layout(
+                    xaxis=dict(title="Local Surrogate Coefficient"),
+                    yaxis=dict(title=""),
+                    template=PLOTLY_TEMPLATE,
+                    height=max(480, len(feature_names) * 24),
+                    margin=dict(l=10, r=60, t=30, b=20),
+                    title=f"Local Surrogate — {model_label} — {bank_label}",
+                )
+                st.plotly_chart(fig_lime, width='stretch')
+
+                # Top-5 local drivers
+                top5_lime = lime_df.nlargest(5, "Abs_Coeff")
+                st.markdown(f"##### Top-5 Local Drivers — {model_label} for **{bank_label}**")
+                top5_lime_display = top5_lime[["Feature", "Risk Pillar", "Coefficient"]].copy()
+                top5_lime_display["Direction"] = top5_lime_display["Coefficient"].apply(
+                    lambda v: "Increases Anomaly Score" if v > 0 else "Decreases Anomaly Score"
+                )
+                top5_lime_display = top5_lime_display.reset_index(drop=True)
+                top5_lime_display.index = top5_lime_display.index + 1
+                top5_lime_display.index.name = "Rank"
+                st.dataframe(top5_lime_display, width='stretch')
+
+                # Cross-model comparison for same bank
+                st.markdown("---")
+                st.markdown(f"##### Cross-Model Local Comparison for **{bank_label}**")
+                cross_rows = []
+                for mname, mdata in lime_expl.items():
+                    if selected_lime_bank_idx in mdata:
+                        contribs = mdata[selected_lime_bank_idx]
+                        for fname, coeff in contribs.items():
+                            cross_rows.append({
+                                "Feature": FEATURE_LABELS.get(fname, fname),
+                                "Model": {"IF": "Isolation Forest", "LOF": "LOF", "SVM": "One-Class SVM"}.get(mname, mname),
+                                "Coefficient": coeff,
+                            })
+                if cross_rows:
+                    cross_df = pd.DataFrame(cross_rows)
+                    # Show top 10 features by max absolute coefficient across models
+                    top_feats = cross_df.groupby("Feature")["Coefficient"].apply(
+                        lambda x: x.abs().max()
+                    ).nlargest(10).index.tolist()
+                    cross_df_top = cross_df[cross_df["Feature"].isin(top_feats)]
+
+                    fig_cross = px.bar(
+                        cross_df_top, x="Coefficient", y="Feature", color="Model",
+                        orientation="h", barmode="group", template=PLOTLY_TEMPLATE,
+                        color_discrete_map={
+                            "Isolation Forest": "#2ecc71",
+                            "LOF": "#3498db",
+                            "One-Class SVM": "#e74c3c",
+                        },
+                    )
+                    fig_cross.update_layout(
+                        height=max(400, len(top_feats) * 35),
+                        margin=dict(l=10, r=20, t=30, b=20),
+                        yaxis=dict(categoryorder="total ascending"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                                    xanchor="center", x=0.5, title=None),
+                    )
+                    st.plotly_chart(fig_cross, width='stretch')

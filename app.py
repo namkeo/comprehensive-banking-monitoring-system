@@ -180,9 +180,18 @@ def _make_radar(
 
 
 @st.cache_data(show_spinner="Loading & processing banking data ...")
-def load_and_process():
-    """Run the full data pipeline + ML analysis + SHAP and cache the result."""
-    df_processed, df_original, scalers = process_data()
+def load_and_process(_uploaded_file=None):
+    """Run the full data pipeline + ML analysis + SHAP and cache the result.
+
+    Parameters
+    ----------
+    _uploaded_file : file-like object, optional
+        A CSV file object from ``st.file_uploader``.  The leading underscore
+        tells Streamlit not to hash this argument (it is unhashable).
+    """
+    df_processed, df_original, scalers = process_data(
+        uploaded_file=_uploaded_file,
+    )
     detector = BankAnomalyDetector()
     df_result = detector.run_full_analysis(df_processed, df_original)
 
@@ -222,14 +231,46 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    # ----- Data upload ------------------------------------------------
+    uploaded_csv = st.file_uploader(
+        "Tải lên tệp dữ liệu Ngân hàng (.csv)",
+        type=["csv"],
+        help="Tải lên tệp CSV chứa dữ liệu ngân hàng. "
+             "Tệp phải có đầy đủ 26 cột ML features theo cấu hình hệ thống.",
+    )
+
+    if uploaded_csv is not None:
+        st.sidebar.success("Đã tải tệp thành công!")
+    else:
+        st.sidebar.info("Đang sử dụng dữ liệu mặc định hệ thống.")
+
     if st.button("Run Analysis", width='stretch', type="primary"):
         load_and_process.clear()
         st.rerun()
 
-    st.markdown("#### Filters")
+    # ----- Load & process data ----------------------------------------
+    try:
+        df_full, _scalers, _shap_values, _shap_base, _xai_artifacts = (
+            load_and_process(_uploaded_file=uploaded_csv)
+        )
+    except KeyError as exc:
+        st.error(
+            f"**Lỗi cấu trúc dữ liệu:** Tệp CSV thiếu các cột bắt buộc.\n\n"
+            f"```\n{exc}\n```\n\n"
+            f"Vui lòng kiểm tra lại tệp và đảm bảo có đầy đủ 26 cột ML features "
+            f"theo định nghĩa trong `config.py`."
+        )
+        st.stop()
+    except Exception as exc:
+        st.error(
+            f"**Lỗi xử lý dữ liệu:** {exc}\n\n"
+            f"Vui lòng kiểm tra định dạng tệp CSV và thử lại."
+        )
+        st.stop()
 
-    df_full, _scalers, _shap_values, _shap_base, _xai_artifacts = load_and_process()
     df_full["_period_dt"] = pd.to_datetime(df_full["period"], format="mixed")
+
+    st.markdown("#### Filters")
 
     # Filter options
     all_periods: List[str] = df_full.sort_values("_period_dt")["period"].unique().tolist()

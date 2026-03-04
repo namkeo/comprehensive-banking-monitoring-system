@@ -29,7 +29,7 @@ from __future__ import annotations
 import operator
 import os
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, IO, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -91,12 +91,35 @@ _OP_MAP = {
 #  Stage 1 – Load
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_data(filepath: str = DATA_PATH) -> pd.DataFrame:
-    """Load the raw CSV dataset into a pandas DataFrame."""
+def load_data(
+    filepath: str = DATA_PATH,
+    uploaded_file: Optional[Union[IO, Any]] = None,
+) -> pd.DataFrame:
+    """Load the raw CSV dataset into a pandas DataFrame.
+
+    Parameters
+    ----------
+    filepath : str
+        Path to a local CSV file (used when *uploaded_file* is ``None``).
+    uploaded_file : file-like object, optional
+        A file-like object (e.g. from ``st.file_uploader``).  When provided
+        the CSV is read directly from this object and *filepath* is ignored.
+    """
     try:
+        if uploaded_file is not None:
+            df: pd.DataFrame = pd.read_csv(uploaded_file)
+            source_label = getattr(uploaded_file, "name", "uploaded file")
+            if df.empty:
+                raise pd.errors.EmptyDataError("Uploaded CSV is empty.")
+            print(
+                f"[DataProcessor] Loaded {len(df)} rows x "
+                f"{len(df.columns)} columns from {source_label}"
+            )
+            return df
+
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Data file not found at: {filepath}")
-        df: pd.DataFrame = pd.read_csv(filepath)
+        df = pd.read_csv(filepath)
         if df.empty:
             raise pd.errors.EmptyDataError("Loaded CSV is empty.")
         print(
@@ -305,12 +328,13 @@ def _scale_feature_group(
 
 def process_data(
     filepath: str = DATA_PATH,
+    uploaded_file: Optional[Union[IO, Any]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, StandardScaler]]:
     """End-to-end data processing pipeline.
 
     Stages
     ------
-    1. Load CSV
+    1. Load CSV (from *uploaded_file* if provided, else from *filepath*)
     2. Median-impute missing values
     3. Validate all 26 ML feature columns exist
     4. Feature engineering (risk_to_profit_ratio, efficiency_ratio)
@@ -325,7 +349,7 @@ def process_data(
         * ``scalers``      – dict[group_name → fitted StandardScaler].
     """
     # Stage 1 – Load
-    df_raw: pd.DataFrame = load_data(filepath)
+    df_raw: pd.DataFrame = load_data(filepath, uploaded_file=uploaded_file)
 
     # Stage 2 – Impute
     df_clean: pd.DataFrame = _impute_missing_values(df_raw)

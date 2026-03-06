@@ -2,14 +2,16 @@
 app.py - BankGuard AI 360 Dashboard.
 =========================================
 
-5-tab Streamlit command-center leveraging the Multi-Algorithm Consensus
-Scoring Engine, Expert Rule Engine and SHAP Explainability:
+7-tab Streamlit command-center leveraging the Multi-Algorithm Consensus
+Scoring Engine, Expert Rule Engine, SHAP Explainability, EWS and Stress-Testing:
 
     Tab 1 - Executive Summary     (KPI cards, Risk Trajectory line chart)
     Tab 2 - Multi-Algo Comparison (IF/LOF/SVM agreement heatmap)
     Tab 3 - Risk Pillar Deep Dive (per-pillar scatter, outlier coloring)
     Tab 4 - 360 Bank Profiler     (radar, rule violations, funding pie)
     Tab 5 - XAI & Model Evaluation (Global SHAP importance, Local waterfall)
+    Tab 6 - EWS (Early Warning)   (Risk heatmap, trajectory line chart)
+    Tab 7 - Stress-Test           (Shock sliders, CAR table, compliance bar)
 
 Author : BankGuard AI Team - Senior Streamlit UI/UX Developer
 Created: 2026-03-02
@@ -28,12 +30,14 @@ import streamlit as st
 
 from config import (
     ALL_ML_FEATURES,
+    EXPERT_RULES,
     FEATURE_LABELS,
     RISK_PILLARS,
     SECTOR_LABELS,
     SECTOR_LOANS_COLUMNS,
 )
 from models.anomaly_detector import BankAnomalyDetector, PILLAR_KEYS, _FEATURE_TO_GROUP
+from models.risk_simulators import run_stress_scenario, _REQUIRED_COLS as _STRESS_REQUIRED_COLS
 from utils.data_processor import process_data
 
 # =====================================================================
@@ -334,15 +338,17 @@ st.caption(
 )
 
 # =====================================================================
-#  Tabs (4)
+#  Tabs (7)
 # =====================================================================
 
-tab_exec, tab_algo, tab_pillar, tab_profiler, tab_xai = st.tabs([
+tab_exec, tab_algo, tab_pillar, tab_profiler, tab_xai, tab_ews, tab_stress = st.tabs([
     "Executive Summary",
     "Multi-Algo Comparison",
     "Risk Pillar Deep Dive",
     "360 Bank Profiler",
     "XAI & Model Evaluation",
+    "Hệ thống Cảnh báo sớm (EWS)",
+    "Kiểm tra sức chịu đựng (Stress-test)",
 ])
 
 # Consensus column names
@@ -1488,3 +1494,337 @@ with tab_xai:
                                     xanchor="center", x=0.5, title=None),
                     )
                     st.plotly_chart(fig_cross, width='stretch')
+
+
+# -----------------------------------------------------------------
+#  TAB 6 - Hệ thống Cảnh báo sớm (EWS)
+# -----------------------------------------------------------------
+
+with tab_ews:
+    st.subheader("Hệ thống Cảnh báo sớm (Early Warning System)")
+
+    # Check EWS columns exist
+    _ews_ready = all(
+        c in df.columns for c in ["EWS_Score", "npl_delta", "car_delta", "lcr_delta", "deterioration_flag"]
+    )
+
+    if not _ews_ready:
+        st.warning("Dữ liệu EWS chưa sẵn sàng. Vui lòng kiểm tra pipeline xử lý dữ liệu.")
+    else:
+        # --- KPI row ---
+        latest_snap = _get_latest_snapshot(df)
+        n_rapid = int((latest_snap["deterioration_flag"] == "Rapid Deterioration").sum())
+        avg_ews = float(latest_snap["EWS_Score"].mean())
+        max_ews = float(latest_snap["EWS_Score"].max())
+        max_ews_bank = latest_snap.loc[latest_snap["EWS_Score"].idxmax(), "bank_id"]
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Avg EWS Score", f"{avg_ews:.1f}", help="Trung bình EWS Score (0-100) kỳ gần nhất")
+        k2.metric("Max EWS Score", f"{max_ews:.1f}", delta=max_ews_bank, delta_color="off")
+        k3.metric("Rapid Deterioration", f"{n_rapid}", delta=f"/ {len(latest_snap)} banks", delta_color="inverse")
+        k4.metric("Stable Banks", f"{len(latest_snap) - n_rapid}", delta=f"{(len(latest_snap) - n_rapid) / len(latest_snap) * 100:.0f}%", delta_color="off")
+
+        st.markdown("---")
+
+        # ============================================================
+        #  EWS Risk Velocity Heatmap
+        # ============================================================
+        st.markdown("#### Risk Velocity Heatmap (Kỳ gần nhất)")
+
+        heatmap_data = latest_snap[["bank_id", "npl_delta", "car_delta", "lcr_delta", "EWS_Score"]].copy()
+        heatmap_data = heatmap_data.sort_values("EWS_Score", ascending=False)
+        heatmap_data = heatmap_data.set_index("bank_id")
+
+        # Rename for display
+        heatmap_display = heatmap_data.rename(columns={
+            "npl_delta": "NPL Δ%",
+            "car_delta": "CAR Δ%",
+            "lcr_delta": "LCR Δ%",
+            "EWS_Score": "EWS Score",
+        })
+
+        # Convert deltas to percentage for display
+        for col in ["NPL Δ%", "CAR Δ%", "LCR Δ%"]:
+            heatmap_display[col] = (heatmap_display[col] * 100).round(2)
+
+        fig_heatmap = go.Figure(data=go.Heatmap(
+            z=heatmap_display.values,
+            x=heatmap_display.columns.tolist(),
+            y=heatmap_display.index.tolist(),
+            colorscale=[
+                [0, "#2ecc71"],
+                [0.4, "#f1c40f"],
+                [0.7, "#e67e22"],
+                [1, "#e74c3c"],
+            ],
+            text=heatmap_display.values.round(2),
+            texttemplate="%{text}",
+            textfont=dict(size=11),
+            hovertemplate="<b>%{y}</b><br>%{x}: %{z:.2f}<extra></extra>",
+        ))
+        fig_heatmap.update_layout(
+            height=max(350, len(heatmap_display) * 40),
+            margin=dict(l=10, r=10, t=30, b=10),
+            template=PLOTLY_TEMPLATE,
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig_heatmap, use_container_width=True)
+
+        st.markdown("---")
+
+        # ============================================================
+        #  Bank Risk Trajectory (line chart)
+        # ============================================================
+        st.markdown("#### Risk Trajectory – Xu hướng rủi ro theo thời gian")
+
+        ews_bank_list = sorted(df["bank_id"].unique().tolist())
+        selected_ews_bank = st.selectbox(
+            "Chọn ngân hàng để xem xu hướng",
+            options=ews_bank_list,
+            key="ews_bank_select",
+        )
+
+        bank_ts = df[df["bank_id"] == selected_ews_bank].sort_values("_period_dt").copy()
+
+        if len(bank_ts) < 2:
+            st.info("Không đủ dữ liệu đa kỳ để hiển thị xu hướng.")
+        else:
+            # Melt for multi-line chart
+            trajectory_cols = {
+                "npl_ratio": "NPL Ratio",
+                "capital_adequacy_ratio": "CAR",
+                "liquidity_coverage_ratio": "LCR",
+            }
+            traj_df = bank_ts[["period"] + list(trajectory_cols.keys())].copy()
+            traj_df = traj_df.rename(columns=trajectory_cols)
+            traj_melted = traj_df.melt(id_vars="period", var_name="Metric", value_name="Value")
+
+            fig_traj = px.line(
+                traj_melted, x="period", y="Value", color="Metric",
+                markers=True, template=PLOTLY_TEMPLATE,
+                color_discrete_map={"NPL Ratio": "#e74c3c", "CAR": "#1abc9c", "LCR": "#3498db"},
+                labels={"period": "Kỳ báo cáo", "Value": "Giá trị"},
+            )
+            fig_traj.update_layout(
+                height=400,
+                margin=dict(l=10, r=10, t=30, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+            )
+            st.plotly_chart(fig_traj, use_container_width=True)
+
+            # EWS Score trajectory
+            fig_ews_line = px.area(
+                bank_ts, x="period", y="EWS_Score",
+                template=PLOTLY_TEMPLATE,
+                labels={"period": "Kỳ báo cáo", "EWS_Score": "EWS Score"},
+                color_discrete_sequence=["#e67e22"],
+            )
+            fig_ews_line.update_layout(
+                height=280,
+                margin=dict(l=10, r=10, t=30, b=10),
+            )
+            fig_ews_line.add_hline(y=50, line_dash="dash", line_color="#e74c3c",
+                                   annotation_text="Ngưỡng cảnh báo (50)")
+            st.plotly_chart(fig_ews_line, use_container_width=True)
+
+            # Deterioration timeline
+            rapid_periods = bank_ts[bank_ts["deterioration_flag"] == "Rapid Deterioration"]
+            if not rapid_periods.empty:
+                st.warning(
+                    f"**{selected_ews_bank}** có {len(rapid_periods)} kỳ bị đánh dấu "
+                    f"'Rapid Deterioration': {', '.join(rapid_periods['period'].tolist())}"
+                )
+            else:
+                st.success(f"**{selected_ews_bank}** không có kỳ nào bị đánh dấu 'Rapid Deterioration'.")
+
+
+# -----------------------------------------------------------------
+#  TAB 7 - Kiểm tra sức chịu đựng (Stress-test)
+# -----------------------------------------------------------------
+
+with tab_stress:
+    st.subheader("Kiểm tra sức chịu đựng (Stress-Testing Engine)")
+
+    # --- Sidebar-style sliders (inside the tab for context) -----------
+    st.markdown("#### Thiết lập kịch bản Stress-test")
+    sl1, sl2, sl3 = st.columns(3)
+    with sl1:
+        npl_pct = st.slider(
+            "NPL Increase (%)", min_value=0, max_value=200, value=50, step=5,
+            help="Tỷ lệ tăng NPL. VD: 50% → NPL tăng gấp 1.5 lần.",
+            key="stress_npl_slider",
+        )
+    with sl2:
+        deposit_pct = st.slider(
+            "Deposit Outflow (%)", min_value=0, max_value=50, value=10, step=1,
+            help="Tỷ lệ rút tiền gửi. VD: 10% → deposits giảm 10%.",
+            key="stress_deposit_slider",
+        )
+    with sl3:
+        asset_pct = st.slider(
+            "Asset Devaluation (%)", min_value=0, max_value=50, value=0, step=1,
+            help="Tỷ lệ giảm giá tài sản. VD: 15% → assets giảm 15%.",
+            key="stress_asset_slider",
+        )
+
+    # Convert slider % to multipliers
+    _npl_shock = 1.0 + npl_pct / 100.0       # e.g. 50% -> 1.5
+    _deposit_shock = 1.0 - deposit_pct / 100.0  # e.g. 10% -> 0.9
+    _asset_deval = 1.0 - asset_pct / 100.0      # e.g. 15% -> 0.85
+
+    # Use latest snapshot for stress testing
+    latest_for_stress = _get_latest_snapshot(df)
+
+    # Check required columns
+    _stress_ready = all(c in latest_for_stress.columns for c in _STRESS_REQUIRED_COLS)
+
+    if not _stress_ready:
+        st.warning("Dữ liệu không đủ cột để chạy Stress-test. Vui lòng kiểm tra dataset.")
+    else:
+        try:
+            stress_result = run_stress_scenario(
+                latest_for_stress,
+                npl_shock=_npl_shock,
+                deposit_shock=_deposit_shock,
+                asset_devaluation=_asset_deval,
+            )
+        except (ValueError, KeyError) as e:
+            st.error(f"Lỗi khi chạy Stress-test: {e}")
+            st.stop()
+
+        summary = stress_result["summary"]
+        comparison = stress_result["comparison"]
+        breaches = stress_result["breaches"]
+
+        st.markdown("---")
+
+        # ============================================================
+        #  Impact Metrics (st.metric with delta)
+        # ============================================================
+        st.markdown("#### Tác động Stress-test")
+        m1, m2, m3, m4 = st.columns(4)
+
+        car_delta = summary["stressed_avg_car"] - summary["baseline_avg_car"]
+        lcr_delta = summary["stressed_avg_lcr"] - summary["baseline_avg_lcr"]
+        npl_delta_val = summary["stressed_avg_npl"] - summary["baseline_avg_npl"]
+        breach_delta = summary["stressed_total_breaches"] - summary["baseline_total_breaches"]
+
+        m1.metric(
+            "Avg CAR",
+            f"{summary['stressed_avg_car']:.2%}",
+            delta=f"{car_delta:+.2%}",
+            delta_color="inverse",
+        )
+        m2.metric(
+            "Avg LCR",
+            f"{summary['stressed_avg_lcr']:.2%}",
+            delta=f"{lcr_delta:+.2%}",
+            delta_color="inverse",
+        )
+        m3.metric(
+            "Avg NPL Ratio",
+            f"{summary['stressed_avg_npl']:.2%}",
+            delta=f"{npl_delta_val:+.2%}",
+            delta_color="inverse",
+        )
+        m4.metric(
+            "Total Breaches",
+            f"{summary['stressed_total_breaches']}",
+            delta=f"{breach_delta:+d} vs baseline",
+            delta_color="inverse",
+        )
+
+        st.markdown("---")
+
+        # ============================================================
+        #  CAR Stress Table: Bank ID | Original CAR | Stressed CAR | Status
+        # ============================================================
+        st.markdown("#### Chi tiết CAR theo ngân hàng")
+
+        car_comp = comparison[comparison["metric"] == "capital_adequacy_ratio"].copy()
+        if not car_comp.empty:
+            car_table = car_comp[["bank_id", "baseline", "stressed", "delta_pct"]].copy()
+            car_table.columns = ["Bank ID", "Original CAR", "Stressed CAR", "Δ%"]
+
+            # Pass/Fail based on Basel III 8% threshold
+            car_threshold = EXPERT_RULES["CAR_CRITICAL"]["threshold"]
+            car_table["Status"] = np.where(
+                car_table["Stressed CAR"] >= car_threshold, "✅ Pass", "❌ Fail"
+            )
+            car_table["Original CAR"] = car_table["Original CAR"].apply(lambda x: f"{x:.2%}")
+            car_table["Stressed CAR"] = car_table["Stressed CAR"].apply(lambda x: f"{x:.2%}")
+            car_table["Δ%"] = car_table["Δ%"].apply(lambda x: f"{x:+.2f}%")
+
+            # Color the status
+            n_pass = int(car_table["Status"].str.contains("Pass").sum())
+            n_fail = int(car_table["Status"].str.contains("Fail").sum())
+
+            st.dataframe(
+                car_table,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Bank ID": st.column_config.TextColumn("Bank ID", width="medium"),
+                    "Status": st.column_config.TextColumn("Status", width="small"),
+                },
+            )
+
+            st.caption(f"Ngưỡng CAR tối thiểu: {car_threshold:.0%} (Basel III). "
+                       f"**{n_pass}** Pass / **{n_fail}** Fail.")
+
+            st.markdown("---")
+
+            # ============================================================
+            #  Compliance Bar Chart: Before vs After
+            # ============================================================
+            st.markdown("#### So sánh tuân thủ trước và sau Stress-test")
+
+            # Count compliant banks for key rules before and after
+            baseline_breaches = stress_result["breaches"]  # stressed breaches
+            # Re-compute baseline compliance from original data
+            _car_pass_before = int((latest_for_stress["capital_adequacy_ratio"] >= car_threshold).sum())
+            _car_fail_before = len(latest_for_stress) - _car_pass_before
+
+            # After stress: parse from car_table
+            _car_pass_after = n_pass
+            _car_fail_after = n_fail
+
+            # LCR compliance
+            lcr_threshold = EXPERT_RULES["LCR_CRITICAL"]["threshold"]
+            lcr_comp = comparison[comparison["metric"] == "liquidity_coverage_ratio"]
+            _lcr_pass_before = int((latest_for_stress["liquidity_coverage_ratio"] >= lcr_threshold).sum())
+            _lcr_pass_after = int((lcr_comp["stressed"] >= lcr_threshold).sum()) if not lcr_comp.empty else 0
+
+            # NPL compliance
+            npl_threshold = EXPERT_RULES["NPL_WARNING"]["threshold"]
+            _npl_pass_before = int((latest_for_stress["npl_ratio"] <= npl_threshold).sum())
+            npl_comp = comparison[comparison["metric"] == "npl_ratio"]
+            _npl_pass_after = int((npl_comp["stressed"] <= npl_threshold).sum()) if not npl_comp.empty else 0
+
+            compliance_data = pd.DataFrame({
+                "Metric": ["CAR ≥ 8%", "CAR ≥ 8%", "LCR ≥ 100%", "LCR ≥ 100%", "NPL ≤ 3%", "NPL ≤ 3%"],
+                "Scenario": ["Baseline", "Stressed", "Baseline", "Stressed", "Baseline", "Stressed"],
+                "Compliant Banks": [
+                    _car_pass_before, _car_pass_after,
+                    _lcr_pass_before, _lcr_pass_after,
+                    _npl_pass_before, _npl_pass_after,
+                ],
+            })
+
+            fig_compliance = px.bar(
+                compliance_data, x="Metric", y="Compliant Banks", color="Scenario",
+                barmode="group", template=PLOTLY_TEMPLATE,
+                color_discrete_map={"Baseline": "#2ecc71", "Stressed": "#e74c3c"},
+                text="Compliant Banks",
+            )
+            fig_compliance.update_layout(
+                height=400,
+                margin=dict(l=10, r=10, t=30, b=10),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+                yaxis_title="Số ngân hàng tuân thủ",
+            )
+            fig_compliance.update_traces(textposition="outside")
+            st.plotly_chart(fig_compliance, use_container_width=True)
+
+        else:
+            st.info("Không có dữ liệu CAR trong kết quả stress-test.")

@@ -20,12 +20,15 @@ if _PROJECT_ROOT not in sys.path:
 from config import ALL_ML_FEATURES, EXPERT_RULES, RISK_PILLARS, SECTOR_LOANS_COLUMNS
 from utils.data_processor import (
     DATA_PATH,
+    EWS_DELTA_COLS,
     FEATURE_GROUPS,
     _create_efficiency_ratio,
     _create_risk_to_profit_ratio,
     _impute_missing_values,
     _scale_feature_group,
     _validate_features,
+    calculate_ews_score,
+    calculate_risk_trends,
     evaluate_expert_rules,
     load_data,
     process_data,
@@ -252,7 +255,153 @@ class TestExpertRules:
             assert "CAR_CRITICAL" not in violations
 
 
-# ── Stage 6: Scaling ─────────────────────────────────────────────────
+# ── Stage 6: EWS (Early Warning System) ─────────────────────────────
+
+def _make_multi_period_df(n_banks: int = 4, n_periods: int = 4) -> pd.DataFrame:
+    """Create a multi-bank, multi-period DataFrame for EWS testing."""
+    rng = np.random.default_rng(99)
+    periods = ["3/31/2021", "6/30/2021", "9/30/2021", "12/31/2021"][:n_periods]
+    rows = []
+    for b in range(n_banks):
+        for p in periods:
+            row = {"bank_id": f"BANK_{b:03d}", "period": p}
+            for feat in ALL_ML_FEATURES:
+                row[feat] = rng.uniform(0, 1)
+            for col in SECTOR_LOANS_COLUMNS:
+                row[col] = rng.uniform(1000, 50000)
+            row.update({
+                "bank_type": "large", "region": "north",
+                "external_credit_rating": "A", "stability": "high",
+                "total_assets": 100000, "total_loans": 60000,
+                "obs_risk_indicator": 0.5,
+                "operating_expenses": 1000, "operating_income": 2000,
+            })
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def multi_period_df():
+    return _make_multi_period_df()
+
+
+class TestRiskTrends:
+    def test_adds_delta_columns(self, multi_period_df):
+        result = calculate_risk_trends(multi_period_df)
+        for delta_col in EWS_DELTA_COLS.values():
+            assert delta_col in result.columns
+
+    def test_adds_deterioration_flag(self, multi_period_df):
+        result = calculate_risk_trends(multi_period_df)
+        assert "deterioration_flag" in result.columns
+        assert set(result["deterioration_flag"].unique()).issubset(
+            {"Stable", "Rapid Deterioration"}
+        )
+
+    def test_first_period_delta_is_zero(self, multi_period_df):
+        result = calculate_risk_trends(multi_period_df)
+        # After sorting, the first row per bank should have delta = 0
+        for bank_id in result["bank_id"].unique():
+            bank_rows = result[result["bank_id"] == bank_id]
+            first_row = bank_rows.iloc[0]
+            for delta_col in EWS_DELTA_COLS.values():
+                assert first_row[delta_col] == 0.0
+
+    def test_rapid_deterioration_npl_spike(self):
+        """NPL increase > 20% should flag Rapid Deterioration."""
+        df = _make_multi_period_df(n_banks=1, n_periods=2)
+        # Force NPL spike: period 1 = 0.01, period 2 = 0.02 (100% increase)
+        df.iloc[0, df.columns.get_loc("npl_ratio")] = 0.01
+        df.iloc[1, df.columns.get_loc("npl_ratio")] = 0.02
+        # Keep CAR stable
+        df["capital_adequacy_ratio"] = 0.15
+        result = calculate_risk_trends(df)
+        assert result.iloc[1]["deterioration_flag"] == "Rapid Deterioration"
+
+    def test_rapid_deterioration_car_drop(self):
+        """CAR decrease > 15% should flag Rapid Deterioration."""
+        df = _make_multi_period_df(n_banks=1, n_periods=2)
+        df["npl_ratio"] = 0.02  # stable
+        df.iloc[0, df.columns.get_loc("capital_adequacy_ratio")] = 0.20
+        df.iloc[1, df.columns.get_loc("capital_adequacy_ratio")] = 0.10  # -50%
+        result = calculate_risk_trends(df)
+        assert result.iloc[1]["deterioration_flag"] == "Rapid Deterioration"
+
+    def test_stable_when_no_rapid_change(self):
+        """Small changes should remain Stable."""
+        df = _make_multi_period_df(n_banks=1, n_periods=2)
+        df["npl_ratio"] = 0.02
+        df["capital_adequacy_ratio"] = 0.15
+        df["liquidity_coverage_ratio"] = 1.2
+        result = calculate_risk_trends(df)
+        assert result.iloc[1]["deterioration_flag"] == "Stable"
+
+    def test_does_not_mutate_input(self, multi_period_df):
+        original_cols = set(multi_period_df.columns)
+        calculate_risk_trends(multi_period_df)
+        assert set(multi_period_df.columns) == original_cols
+
+
+class TestEWSScore:
+    def test_adds_ews_score_column(self, multi_period_df):
+        df = calculate_risk_trends(multi_period_df)
+        df = evaluate_expert_rules(df)
+        result = calculate_ews_score(df)
+        assert "EWS_Score" in result.columns
+
+    def test_ews_score_range(self, multi_period_df):
+        df = calculate_risk_trends(multi_period_df)
+        df = evaluate_expert_rules(df)
+        result = calculate_ews_score(df)
+        assert (result["EWS_Score"] >= 0).all()
+        assert (result["EWS_Score"] <= 100).all()
+
+    def test_compliant_stable_bank_low_score(self):
+        """A compliant bank with no velocity should have low EWS_Score."""
+        df = _make_multi_period_df(n_banks=1, n_periods=2)
+        df["npl_ratio"] = 0.01
+        df["capital_adequacy_ratio"] = 0.15
+        df["liquidity_coverage_ratio"] = 1.5
+        df["loan_to_deposit_ratio"] = 0.8
+        df["sector_concentration_hhi"] = 0.1
+        df["nsfr"] = 1.2
+        df["return_on_assets"] = 0.01
+        df["wholesale_dependency_ratio"] = 0.3
+        df["top20_borrower_concentration"] = 0.15
+        df = calculate_risk_trends(df)
+        df = evaluate_expert_rules(df)
+        result = calculate_ews_score(df)
+        # Should be very low (near 0)
+        assert result["EWS_Score"].max() < 10
+
+    def test_high_risk_bank_high_score(self):
+        """A bank with many violations + rapid deterioration → high score."""
+        df = _make_multi_period_df(n_banks=1, n_periods=2)
+        # Many rule violations
+        df["capital_adequacy_ratio"] = 0.05
+        df["npl_ratio"] = [0.02, 0.06]  # 200% spike
+        df["liquidity_coverage_ratio"] = 0.7
+        df["loan_to_deposit_ratio"] = 1.3
+        df["sector_concentration_hhi"] = 0.4
+        df["nsfr"] = 0.8
+        df["return_on_assets"] = -0.01
+        df["wholesale_dependency_ratio"] = 0.6
+        df["top20_borrower_concentration"] = 0.3
+        df = calculate_risk_trends(df)
+        df = evaluate_expert_rules(df)
+        result = calculate_ews_score(df)
+        # Second period should have high score
+        assert result.iloc[1]["EWS_Score"] > 50
+
+    def test_does_not_mutate_input(self, multi_period_df):
+        df = calculate_risk_trends(multi_period_df)
+        df = evaluate_expert_rules(df)
+        original_cols = set(df.columns)
+        calculate_ews_score(df)
+        assert set(df.columns) == original_cols
+
+
+# ── Stage 7: Scaling ─────────────────────────────────────────────────
 
 class TestScaling:
     def test_scale_feature_group(self, sample_df):
@@ -285,6 +434,13 @@ class TestProcessDataIntegration:
         # df_original has engineered features
         assert "risk_to_profit_ratio" in df_orig.columns
         assert "efficiency_ratio" in df_orig.columns
+        # df_original has EWS columns
+        for delta_col in EWS_DELTA_COLS.values():
+            assert delta_col in df_orig.columns
+        assert "deterioration_flag" in df_orig.columns
+        assert "EWS_Score" in df_orig.columns
+        assert (df_orig["EWS_Score"] >= 0).all()
+        assert (df_orig["EWS_Score"] <= 100).all()
 
     def test_processed_features_are_scaled(self, sample_csv):
         df_proc, _, _ = process_data(sample_csv)

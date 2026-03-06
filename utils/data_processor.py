@@ -3,7 +3,7 @@ data_processor.py – Data Ingestion & Transformation Pipeline for BankGuard AI.
 ==============================================================================
 
 Ingests the **360° config.py** (8 Risk Pillars, Expert Rules, ML Models Config)
-and executes a five-stage pipeline:
+and executes a seven-stage pipeline:
 
     1. **Load**       – CSV ingestion with basic validation.
     2. **Impute**     – Median imputation for every numeric column.
@@ -13,7 +13,10 @@ and executes a five-stage pipeline:
     5. **Rule Engine**– Evaluate ``EXPERT_RULES`` thresholds from config.py →
                         ``rule_violations`` (list of triggered rule IDs) and
                         ``rule_risk_score`` (count of violations) per row.
-    6. **Scale**      – One ``StandardScaler`` per risk pillar (7 groups,
+    6. **EWS**        – Early Warning System: risk velocity (``npl_delta``,
+                        ``car_delta``, ``lcr_delta``), ``deterioration_flag``,
+                        and composite ``EWS_Score`` (0-100).
+    7. **Scale**      – One ``StandardScaler`` per risk pillar (7 groups,
                         26 features total) for ML input.
 
 Returns
@@ -85,6 +88,25 @@ _OP_MAP = {
     "eq": operator.eq,
     "ne": operator.ne,
 }
+
+# EWS (Early Warning System) constants
+EWS_TREND_METRICS: List[str] = [
+    "npl_ratio",
+    "capital_adequacy_ratio",
+    "liquidity_coverage_ratio",
+]
+EWS_DELTA_COLS: Dict[str, str] = {
+    "npl_ratio":                "npl_delta",
+    "capital_adequacy_ratio":   "car_delta",
+    "liquidity_coverage_ratio": "lcr_delta",
+}
+# Deterioration thresholds (percentage-change, expressed as fractions)
+_NPL_RAPID_INCREASE: float = 0.20   # NPL increases by >20%
+_CAR_RAPID_DECREASE: float = -0.15  # CAR decreases by >15% (pct_change < -0.15)
+
+# EWS_Score component weights (sum = 1.0)
+_EWS_W_CURRENT: float = 0.50   # weight for current-status component
+_EWS_W_VELOCITY: float = 0.50  # weight for velocity component
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -307,7 +329,137 @@ def evaluate_expert_rules(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Stage 6 – Scaling
+#  Stage 6 – Early Warning System (EWS)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def calculate_risk_trends(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute period-over-period risk velocity for each bank.
+
+    The function:
+    1. Parses ``period`` as a date and sorts by ``(bank_id, _period_dt)``.
+    2. Calculates ``pct_change()`` per bank for ``npl_ratio``,
+       ``capital_adequacy_ratio``, and ``liquidity_coverage_ratio``.
+    3. Fills the first period (no prior data) with 0.
+    4. Adds a ``deterioration_flag``:
+       - ``"Rapid Deterioration"`` if NPL delta > 20 % **or** CAR delta < −15 %.
+       - ``"Stable"`` otherwise.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Unscaled DataFrame with ``bank_id``, ``period``, and the three
+        trend metrics.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of *df* with new columns: ``npl_delta``, ``car_delta``,
+        ``lcr_delta``, ``deterioration_flag``.
+    """
+    df = df.copy()
+
+    # Parse period to datetime for correct chronological sorting
+    df["_period_dt"] = pd.to_datetime(df["period"], format="mixed")
+    df.sort_values(["bank_id", "_period_dt"], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # Per-bank percentage change using .groupby().pct_change()
+    for metric, delta_col in EWS_DELTA_COLS.items():
+        if metric in df.columns:
+            df[delta_col] = (
+                df.groupby("bank_id")[metric]
+                .pct_change()
+                .fillna(0.0)
+            )
+        else:
+            df[delta_col] = 0.0
+            print(
+                f"[DataProcessor] WARNING – EWS metric '{metric}' "
+                f"not found; '{delta_col}' set to 0."
+            )
+
+    # Deterioration flag
+    npl_rapid = df["npl_delta"] > _NPL_RAPID_INCREASE
+    car_rapid = df["car_delta"] < _CAR_RAPID_DECREASE
+    df["deterioration_flag"] = np.where(
+        npl_rapid | car_rapid, "Rapid Deterioration", "Stable"
+    )
+
+    # Drop helper column
+    df.drop(columns=["_period_dt"], inplace=True)
+
+    n_rapid = int((df["deterioration_flag"] == "Rapid Deterioration").sum())
+    print(
+        f"[DataProcessor] EWS Risk Trends -> "
+        f"{n_rapid}/{len(df)} observations flagged as Rapid Deterioration"
+    )
+    return df
+
+
+def calculate_ews_score(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute a composite Early Warning Score (0-100) per observation.
+
+    The score blends two equally-weighted components:
+
+    **Current-status component (50 %)** – derived from ``rule_risk_score``:
+        ``current_score = min(rule_risk_score / 5, 1) × 100``
+        (5 violations → maximum 100; capped at 100.)
+
+    **Velocity component (50 %)** – derived from the three delta columns:
+        For each delta the contribution is:
+        - ``npl_delta``:  positive delta is bad  → ``min(max(npl_delta, 0) / 0.5, 1) × 100``
+        - ``car_delta``:  negative delta is bad  → ``min(max(-car_delta, 0) / 0.5, 1) × 100``
+        - ``lcr_delta``:  negative delta is bad  → ``min(max(-lcr_delta, 0) / 0.5, 1) × 100``
+        ``velocity_score = mean of the three sub-scores``
+
+    ``EWS_Score = current_weight × current_score + velocity_weight × velocity_score``
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain ``rule_risk_score``, ``npl_delta``, ``car_delta``,
+        ``lcr_delta``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of *df* with new column ``EWS_Score`` (float, 0-100).
+    """
+    df = df.copy()
+
+    # --- Current-status component (normalised 0-100) ----------------------
+    rule_score = df.get("rule_risk_score", pd.Series(0, index=df.index))
+    current_component = (rule_score / 5).clip(upper=1.0) * 100
+
+    # --- Velocity component (normalised 0-100) ----------------------------
+    npl_d = df.get("npl_delta", pd.Series(0.0, index=df.index))
+    car_d = df.get("car_delta", pd.Series(0.0, index=df.index))
+    lcr_d = df.get("lcr_delta", pd.Series(0.0, index=df.index))
+
+    # Higher NPL is worse; lower CAR/LCR is worse
+    npl_sub = (npl_d.clip(lower=0) / 0.5).clip(upper=1.0) * 100
+    car_sub = ((-car_d).clip(lower=0) / 0.5).clip(upper=1.0) * 100
+    lcr_sub = ((-lcr_d).clip(lower=0) / 0.5).clip(upper=1.0) * 100
+
+    velocity_component = (npl_sub + car_sub + lcr_sub) / 3.0
+
+    # --- Composite --------------------------------------------------------
+    df["EWS_Score"] = (
+        _EWS_W_CURRENT * current_component
+        + _EWS_W_VELOCITY * velocity_component
+    ).round(2).clip(0, 100)
+
+    print(
+        f"[DataProcessor] EWS Score -> "
+        f"mean={df['EWS_Score'].mean():.2f}, "
+        f"min={df['EWS_Score'].min():.2f}, "
+        f"max={df['EWS_Score'].max():.2f}"
+    )
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Stage 7 – Scaling
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _scale_feature_group(
@@ -339,13 +491,14 @@ def process_data(
     3. Validate all 26 ML feature columns exist
     4. Feature engineering (risk_to_profit_ratio, efficiency_ratio)
     5. Expert Rule Engine → rule_violations, rule_risk_score
-    6. StandardScaler per risk pillar (7 groups, 26 features)
+    6. EWS → npl_delta, car_delta, lcr_delta, deterioration_flag, EWS_Score
+    7. StandardScaler per risk pillar (7 groups, 26 features)
 
     Returns
     -------
     (df_processed, df_original, scalers)
         * ``df_processed`` – scaled features ready for ML models.
-        * ``df_original``  – unscaled, enriched with rule engine columns.
+        * ``df_original``  – unscaled, enriched with rule engine + EWS columns.
         * ``scalers``      – dict[group_name → fitted StandardScaler].
     """
     # Stage 1 – Load
@@ -364,10 +517,14 @@ def process_data(
     # Stage 5 – Expert Rule Engine (runs on unscaled data)
     df_clean = evaluate_expert_rules(df_clean)
 
-    # Snapshot the original (unscaled) with rule columns
+    # Stage 6 – Early Warning System (runs on unscaled data, needs rule_risk_score)
+    df_clean = calculate_risk_trends(df_clean)
+    df_clean = calculate_ews_score(df_clean)
+
+    # Snapshot the original (unscaled) with rule + EWS columns
     df_original: pd.DataFrame = df_clean.copy()
 
-    # Stage 6 – Scale for ML
+    # Stage 7 – Scale for ML
     df_processed: pd.DataFrame = df_clean.copy()
     scalers: Dict[str, StandardScaler] = {}
 
@@ -422,4 +579,13 @@ if __name__ == "__main__":
         sample_cols = ["bank_id", "period", "rule_violations", "rule_risk_score"]
         sample_cols = [c for c in sample_cols if c in non_compliant.columns]
         print(non_compliant[sample_cols].head(10).to_string(index=False))
+
+    print(f"\n--- Early Warning System (EWS) ---")
+    ews_cols = ["bank_id", "period", "npl_delta", "car_delta", "lcr_delta",
+                "deterioration_flag", "EWS_Score"]
+    ews_cols = [c for c in ews_cols if c in df_orig.columns]
+    print(df_orig[ews_cols].head(20).to_string(index=False))
+    n_rapid = (df_orig["deterioration_flag"] == "Rapid Deterioration").sum()
+    print(f"\n  Rapid Deterioration: {n_rapid}/{len(df_orig)}")
+    print(f"  EWS_Score: {df_orig['EWS_Score'].describe().to_string()}")
 
